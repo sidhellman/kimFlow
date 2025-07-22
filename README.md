@@ -1,6 +1,4 @@
-Of course. Here is a `README.md` file for the Go workflow library.
 
------
 
 # Go Process Engine
 
