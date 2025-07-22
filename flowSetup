@@ -1,0 +1,360 @@
+// process.go
+package process
+
+import (
+	"fmt"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/hashicorp/go-multierror"
+)
+
+// SharedContext is a map for passing data throughout a pipeline.
+type SharedContext map[string]interface{}
+
+// Worker is the fundamental interface for any task or component in a process.
+type Worker interface {
+	// Lifecycle methods that can be customized.
+	Setup(ctx SharedContext) (interface{}, error)
+	Perform(setupResult interface{}) (interface{}, error)
+	Teardown(ctx SharedContext, setupResult, performResult interface{}) (interface{}, error)
+	PerformFallback(setupResult interface{}, exc error) (interface{}, error)
+
+	// Internal execution wrappers for enabling virtual method behavior.
+	performTask(setupResult interface{}) (interface{}, error)
+	execute(ctx SharedContext) (interface{}, error)
+
+	// Start is the primary method to run a standalone worker.
+	Start(ctx SharedContext) (interface{}, error)
+
+	// Configuration and chaining methods.
+	SetConfig(config map[string]interface{})
+	Then(nextWorker Worker, outcome string) Worker
+	getNext(outcome string) (Worker, bool)
+	getConfig() map[string]interface{}
+}
+
+// CoreWorker provides the foundational implementation for a Worker.
+type CoreWorker struct {
+	self       Worker // A reference to the embedding struct for "virtual methods".
+	config     map[string]interface{}
+	successors map[string]Worker
+}
+
+// initialize must be called by the constructor of any embedding struct.
+func (c *CoreWorker) initialize(self Worker) {
+	c.self = self
+	c.config = make(map[string]interface{})
+	c.successors = make(map[string]Worker)
+}
+
+// Default implementations, designed to be overridden.
+func (c *CoreWorker) Setup(ctx SharedContext) (interface{}, error)                                      { return nil, nil }
+func (c *CoreWorker) Perform(setupResult interface{}) (interface{}, error)                               { return "default", nil }
+func (c *CoreWorker) Teardown(ctx SharedContext, sr, pr interface{}) (interface{}, error)             { return nil, nil }
+func (c *CoreWorker) PerformFallback(setupResult interface{}, exc error) (interface{}, error)          { return nil, exc }
+
+func (c *CoreWorker) SetConfig(config map[string]interface{}) { c.config = config }
+func (c *CoreWorker) getConfig() map[string]interface{}       { return c.config }
+func (c *CoreWorker) Then(nextWorker Worker, outcome string) Worker {
+	if _, ok := c.successors[outcome]; ok {
+		log.Printf("Warning: Overwriting successor for outcome '%s'", outcome)
+	}
+	c.successors[outcome] = nextWorker
+	return nextWorker
+}
+func (c *CoreWorker) getNext(outcome string) (Worker, bool) {
+	worker, ok := c.successors[outcome]
+	return worker, ok
+}
+
+// performTask is the default execution wrapper, calling the Perform method.
+func (c *CoreWorker) performTask(setupResult interface{}) (interface{}, error) {
+	return c.self.Perform(setupResult)
+}
+
+// execute orchestrates the standard Setup -> Perform -> Teardown lifecycle.
+func (c *CoreWorker) execute(ctx SharedContext) (interface{}, error) {
+	setupResult, err := c.self.Setup(ctx)
+	if err != nil {
+		return nil, err
+	}
+	performResult, err := c.self.performTask(setupResult)
+	if err != nil {
+		return nil, err
+	}
+	_, teardownErr := c.self.Teardown(ctx, setupResult, performResult)
+	if teardownErr != nil {
+		return nil, teardownErr
+	}
+	return performResult, nil
+}
+
+// Start is the public entry point for a single worker.
+func (c *CoreWorker) Start(ctx SharedContext) (interface{}, error) {
+	if len(c.successors) > 0 {
+		log.Println("Warning: Worker has successors but is being started directly. Use a Pipeline.")
+	}
+	return c.self.execute(ctx)
+}
+
+// --- ResilientWorker ---
+// A worker that adds retry logic to its Perform method.
+type ResilientWorker struct {
+	CoreWorker
+	MaxAttempts int
+	RetryDelay  time.Duration
+}
+
+func NewResilientWorker(maxAttempts int, retryDelay time.Duration) *ResilientWorker {
+	r := &ResilientWorker{MaxAttempts: maxAttempts, RetryDelay: retryDelay}
+	r.initialize(r)
+	return r
+}
+
+// performTask overrides CoreWorker.performTask to add the retry loop.
+func (r *ResilientWorker) performTask(setupResult interface{}) (interface{}, error) {
+	var lastErr error
+	for i := 0; i < r.MaxAttempts; i++ {
+		res, err := r.self.Perform(setupResult) // Calls the customizable Perform logic.
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+		if i < r.MaxAttempts-1 && r.RetryDelay > 0 {
+			time.Sleep(r.RetryDelay)
+		}
+	}
+	return r.self.PerformFallback(setupResult, lastErr)
+}
+
+// --- SequentialBatchWorker ---
+// A worker that processes a slice of items one by one.
+type SequentialBatchWorker struct {
+	ResilientWorker
+}
+
+func NewSequentialBatchWorker(maxAttempts int, retryDelay time.Duration) *SequentialBatchWorker {
+	b := &SequentialBatchWorker{}
+	b.ResilientWorker.MaxAttempts = maxAttempts
+	b.ResilientWorker.RetryDelay = retryDelay
+	b.initialize(b)
+	return b
+}
+
+// performTask overrides the embedded ResilientWorker's method to process a batch.
+func (b *SequentialBatchWorker) performTask(items interface{}) (interface{}, error) {
+	itemsSlice, ok := items.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("SequentialBatchWorker expects a slice []interface{}, but got %T", items)
+	}
+	results := make([]interface{}, len(itemsSlice))
+	for i, item := range itemsSlice {
+		// Call the "parent" performTask (the retry logic) for each item.
+		res, err := b.ResilientWorker.performTask(item)
+		if err != nil {
+			return nil, fmt.Errorf("error processing item %d: %w", i, err)
+		}
+		results[i] = res
+	}
+	return results, nil
+}
+
+// --- ConcurrentBatchWorker ---
+// A worker that processes a slice of items in parallel.
+type ConcurrentBatchWorker struct {
+	ResilientWorker
+}
+
+func NewConcurrentBatchWorker(maxAttempts int, retryDelay time.Duration) *ConcurrentBatchWorker {
+	c := &ConcurrentBatchWorker{}
+	c.ResilientWorker.MaxAttempts = maxAttempts
+	c.ResilientWorker.RetryDelay = retryDelay
+	c.initialize(c)
+	return c
+}
+
+func (c *ConcurrentBatchWorker) performTask(items interface{}) (interface{}, error) {
+	itemsSlice, ok := items.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("ConcurrentBatchWorker expects a slice []interface{}, but got %T", items)
+	}
+	var wg sync.WaitGroup
+	results := make([]interface{}, len(itemsSlice))
+	errs := make(chan error, len(itemsSlice))
+	for i, item := range itemsSlice {
+		wg.Add(1)
+		go func(idx int, itm interface{}) {
+			defer wg.Done()
+			res, err := c.ResilientWorker.performTask(itm)
+			if err != nil {
+				errs <- fmt.Errorf("error processing item %d: %w", idx, err)
+				return
+			}
+			results[idx] = res
+		}(i, item)
+	}
+	wg.Wait()
+	close(errs)
+	var multiErr *multierror.Error
+	for err := range errs {
+		multiErr = multierror.Append(multiErr, err)
+	}
+	if err := multiErr.ErrorOrNil(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+// --- Pipeline ---
+// Orchestrates a graph of workers.
+type Pipeline struct {
+	CoreWorker
+	EntryPoint Worker
+}
+
+func NewPipeline(entryPoint Worker) *Pipeline {
+	p := &Pipeline{EntryPoint: entryPoint}
+	p.initialize(p)
+	return p
+}
+
+func (p *Pipeline) Entry(entryPoint Worker) Worker {
+	p.EntryPoint = entryPoint
+	return entryPoint
+}
+
+// findNextWorker finds the successor based on the returned outcome string.
+func (p *Pipeline) findNextWorker(current Worker, outcome interface{}) Worker {
+	outcomeStr := "default"
+	if s, ok := outcome.(string); ok {
+		outcomeStr = s
+	}
+	next, ok := current.getNext(outcomeStr)
+	if !ok && outcomeStr != "default" {
+		next, ok = current.getNext("default")
+	}
+	if !ok {
+		log.Printf("Pipeline ends: outcome '%v' not found in successors.", outcome)
+		return nil
+	}
+	return next
+}
+
+// orchestrate walks the worker graph.
+func (p *Pipeline) orchestrate(ctx SharedContext, execConfig map[string]interface{}) (interface{}, error) {
+	if p.EntryPoint == nil {
+		return nil, fmt.Errorf("pipeline has no entry point")
+	}
+	var lastOutcome interface{}
+	var err error
+	pipelineConfig := make(map[string]interface{})
+	for k, v := range p.getConfig() {
+		pipelineConfig[k] = v
+	}
+	for k, v := range execConfig {
+		pipelineConfig[k] = v
+	}
+	currentWorker := p.EntryPoint
+	for currentWorker != nil {
+		currentWorker.SetConfig(pipelineConfig)
+		lastOutcome, err = currentWorker.execute(ctx)
+		if err != nil {
+			return nil, err
+		}
+		currentWorker = p.findNextWorker(currentWorker, lastOutcome)
+	}
+	return lastOutcome, nil
+}
+
+// execute for a pipeline is overridden to call the orchestrator.
+func (p *Pipeline) execute(ctx SharedContext) (interface{}, error) {
+	setupResult, err := p.self.Setup(ctx)
+	if err != nil {
+		return nil, err
+	}
+	orchResult, err := p.orchestrate(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return p.self.Teardown(ctx, setupResult, orchResult)
+}
+
+// Teardown for a pipeline returns the result from the orchestration.
+func (p *Pipeline) Teardown(ctx SharedContext, sr, or interface{}) (interface{}, error) {
+	return or, nil
+}
+
+// --- BatchPipeline ---
+// Runs a pipeline for each batch of configurations from its Setup stage.
+type BatchPipeline struct {
+	Pipeline
+	Concurrent bool // Flag to run batches in parallel.
+}
+
+func NewBatchPipeline(entryPoint Worker, concurrent bool) *BatchPipeline {
+	b := &BatchPipeline{Concurrent: concurrent}
+	b.EntryPoint = entryPoint
+	b.initialize(b)
+	return b
+}
+
+// execute for a BatchPipeline gets a list of configs and orchestrates for each.
+func (b *BatchPipeline) execute(ctx SharedContext) (interface{}, error) {
+	setupResult, err := b.self.Setup(ctx)
+	if err != nil {
+		return nil, err
+	}
+	configList, ok := setupResult.([]map[string]interface{})
+	if !ok {
+		if setupResult == nil {
+			configList = []map[string]interface{}{}
+		} else {
+			return nil, fmt.Errorf("BatchPipeline Setup must return []map[string]interface{}, got %T", setupResult)
+		}
+	}
+	baseConfig := b.getConfig()
+
+	runOrchestration := func(batchConfig map[string]interface{}) error {
+		combinedConfig := make(map[string]interface{})
+		for k, v := range baseConfig {
+			combinedConfig[k] = v
+		}
+		for k, v := range batchConfig {
+			combinedConfig[k] = v
+		}
+		_, orchErr := b.orchestrate(ctx, combinedConfig)
+		return orchErr
+	}
+
+	if b.Concurrent {
+		var wg sync.WaitGroup
+		errs := make(chan error, len(configList))
+		for _, cfg := range configList {
+			wg.Add(1)
+			go func(c map[string]interface{}) {
+				defer wg.Done()
+				if err := runOrchestration(c); err != nil {
+					errs <- err
+				}
+			}(cfg)
+		}
+		wg.Wait()
+		close(errs)
+		var multiErr *multierror.Error
+		for e := range errs {
+			multiErr = multierror.Append(multiErr, e)
+		}
+		if err := multiErr.ErrorOrNil(); err != nil {
+			return nil, err
+		}
+	} else {
+		for _, cfg := range configList {
+			if err := runOrchestration(cfg); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return b.self.Teardown(ctx, setupResult, nil)
+}
